@@ -1,15 +1,12 @@
-//
-//  main.cpp
-//  BackPropagationNN
-//
-//  Created by Motonari Ito on 1/16/16.
-//  Copyright © 2016 Student Gauss. All rights reserved.
-//
+#include "BackPropagationNN.hpp"
 
 #include <iostream>
 
 int main(int argc, const char * argv[]) {
-    // insert code here...
-    std::cout << "Hello, World!\n";
+    BackPropagationNN nn({2, 3, 2});
+
+    nn.train({0.2, 0.3}, {0.1, 0.0});
+
+
     return 0;
 }
