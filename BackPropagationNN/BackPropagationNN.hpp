@@ -1,6 +1,11 @@
 #include <vector>
 #include <random>
 #include <cmath>
+#include <future>
+#include <memory>
+#include <sstream>
+#include <iostream>
+#include <iomanip>
 
 class Matrix
 {
@@ -10,6 +15,7 @@ private:
 public:
     friend std::vector<float> operator*(std::vector<float> const& v, Matrix const& M);
     friend Matrix operator*(Matrix const& lhs, Matrix const& rhs);
+    friend Matrix operator+(Matrix const& lhs, Matrix const& rhs);
     friend Matrix operator*(Matrix const& lhs, float v);
 
     Matrix(int numberOfRows, int numberOfColumns)
@@ -28,21 +34,33 @@ public:
         }
     }
 
-    void initializeWithRandom(std::mt19937& randomGenerator) {
+    void initializeWithRandom(std::mt19937* randomGenerator) {
         std::uniform_real_distribution<float> randomDistribution(-1.0f, +1.0f);
         for (auto& row : data) {
             for (auto& value : row) {
-                value = randomDistribution(randomGenerator);
+                value = randomDistribution(*randomGenerator);
             }
         }
     }
 
-    void set(int rowIndex, int columnIndex, float v) {
-        data[rowIndex][columnIndex] = v;
+    std::vector<float>& operator[](int rowIndex) {
+        return data[rowIndex];
     }
 
-    float get(int rowIndex, int columnIndex) const {
-        return data[rowIndex][columnIndex];
+    std::vector<float> const& operator[](int rowIndex) const {
+        return data[rowIndex];
+    }
+
+    std::string str() const {
+        std::ostringstream stream;
+        for (auto& row : data) {
+            for (auto& value : row) {
+                stream << std::setprecision(5) << std::fixed << std::setw(12);
+                stream << value;
+            }
+            stream << std::endl;
+        }
+        return stream.str();
     }
 
     int rowCount() const
@@ -73,9 +91,14 @@ public:
     }
 
     void operator-=(Matrix const& operand) {
+        if (rowCount() != operand.rowCount() ||
+            columnCount() != operand.columnCount()) {
+            throw std::logic_error("invalid operand.");
+        }
+
         for (int rowIndex = 0; rowIndex != rowCount(); rowIndex++) {
             for (int columnIndex = 0; columnIndex != columnCount(); columnIndex++) {
-                set(rowIndex, columnIndex, get(rowIndex, columnIndex) - operand.get(rowIndex, columnIndex));
+                data[rowIndex][columnIndex] -= operand[rowIndex][columnIndex];
             }
         }
     }
@@ -83,12 +106,18 @@ public:
 
 inline std::vector<float> operator*(const std::vector<float>& v, const Matrix& M)
 {
-    auto& data = M.data;
-    std::vector<float> result(data[0].size(), 0.0f);
+    const int rowCount = M.rowCount();
+    const int columnCount = M.columnCount();
 
-    for (int rowIndex = 0; rowIndex < data.size(); ++rowIndex) {
-        auto const& row = data[rowIndex];
-        for (int columnIndex = 0; columnIndex < row.size(); ++columnIndex) {
+    if (v.size() != rowCount) {
+        throw std::logic_error("invalid operand.");
+    }
+
+    auto& data = M.data;
+    std::vector<float> result(columnCount, 0.0f);
+
+    for (int rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+        for (int columnIndex = 0; columnIndex < columnCount; ++columnIndex) {
             result[columnIndex] += v[rowIndex] * data[rowIndex][columnIndex];
         }
     }
@@ -111,9 +140,32 @@ inline Matrix operator*(Matrix const& lhs, Matrix const& rhs)
             const int count = lhs.columnCount();
             float v = 0;
             for (int index = 0; index != count; ++index) {
-                v += lhs.get(resultRowIndex, index) * rhs.get(index, resultColumnIndex);
+                v += lhs[resultRowIndex][index] * rhs[index][resultColumnIndex];
             }
-            result.set(resultRowIndex, resultColumnIndex, v);
+            result[resultRowIndex][resultColumnIndex] = v;
+        }
+    }
+    return result;
+}
+
+inline Matrix operator+(Matrix const& leftValue, Matrix const& rightValue)
+{
+    if (leftValue.columnCount() != rightValue.columnCount()) {
+        throw std::logic_error("incompatible matrices");
+    }
+
+    if (leftValue.rowCount() != rightValue.rowCount()) {
+        throw std::logic_error("incompatible matrices");
+    }
+
+    const int rowCount = leftValue.rowCount();
+    const int columnCount = leftValue.columnCount();
+
+    Matrix result(rowCount, columnCount);
+
+    for (int rowIndex = 0; rowIndex != rowCount; ++rowIndex) {
+        for (int columnIndex = 0; columnIndex != columnCount; ++columnIndex) {
+            result[rowIndex][columnIndex] = leftValue[rowIndex][columnIndex] + rightValue[rowIndex][columnIndex];
         }
     }
     return result;
@@ -124,10 +176,97 @@ inline Matrix operator*(Matrix const& m, float multiplier)
     Matrix result = m;
     for (int rowIndex = 0; rowIndex != result.rowCount(); rowIndex++) {
         for (int columnIndex = 0; columnIndex != result.columnCount(); columnIndex++) {
-            result.set(rowIndex, columnIndex, result.get(rowIndex, columnIndex) * multiplier);
+            result[rowIndex][columnIndex] *= multiplier;
         }
     }
     return result;
+}
+
+class Expression
+{
+protected:
+    Expression() {}
+public:
+    virtual ~Expression() {}
+    virtual std::future<Matrix> value() = 0;
+};
+
+class BinaryOperator : public Expression
+{
+public:
+    std::shared_ptr<Expression> leftOperand;
+    std::shared_ptr<Expression> rightOperand;
+protected:
+    BinaryOperator(std::shared_ptr<Expression> left, std::shared_ptr<Expression> right)
+        :leftOperand(left), rightOperand(right)
+    {
+    }
+
+    std::shared_ptr<Expression> left() const { return leftOperand; }
+    std::shared_ptr<Expression> right() const { return rightOperand; }
+
+};
+
+class Multiply : public BinaryOperator
+{
+public:
+    Multiply(std::shared_ptr<Expression> left, std::shared_ptr<Expression> right)
+        :BinaryOperator(left, right)
+    {
+    }
+
+    virtual std::future<Matrix> value() {
+        return std::async(std::launch::async, [this]() {
+                Matrix leftValue = left()->value().get();
+                Matrix rightValue = right()->value().get();
+                return leftValue * rightValue;
+            });
+    }
+};
+
+class Plus : public BinaryOperator
+{
+
+public:
+    Plus(std::shared_ptr<Expression> left, std::shared_ptr<Expression> right)
+        :BinaryOperator(left, right)
+    {
+    }
+
+    virtual std::future<Matrix> value() {
+        return std::async(std::launch::async, [this]() {
+                Matrix leftValue = left()->value().get();
+                Matrix rightValue = left()->value().get();
+                return leftValue + rightValue;
+            });
+    }
+};
+
+class Term : public Expression
+{
+    Matrix matrix;
+public:
+    Term(Matrix matrix)
+        :matrix(matrix)
+    {
+    }
+    virtual std::future<Matrix> value() {
+        return std::async(std::launch::deferred, [this]() {
+                return matrix;
+            });
+    }
+};
+
+std::shared_ptr<Expression> operator+(std::shared_ptr<Expression> left, std::shared_ptr<Expression> right)
+{
+    return std::make_shared<Plus>(left, right);
+}
+
+std::shared_ptr<Expression> operator+(Matrix left, Matrix right)
+{
+    std::shared_ptr<Term> leftTerm(new Term(left));
+    std::shared_ptr<Term> rightTerm(new Term(right));
+    return leftTerm + rightTerm;
 }
 
 class Layer
@@ -144,7 +283,7 @@ public:
           int numberOfInputs,
           int numberOfOutputs,
           float learningRate,
-          std::mt19937& randomGenerator)
+          std::mt19937* randomGenerator)
         :layerIndex(layerIndex),
          currentInputs(numberOfInputs),
          learningRate(learningRate),
@@ -156,16 +295,17 @@ public:
 
     void setInputs(std::vector<float> inputs)
     {
-        currentInputs = inputs;
-
-        std::vector<float> nonLinearizedInput(currentInputs.size());
-        if (layerIndex != 0) {
-            std::transform(currentInputs.begin(), currentInputs.end(), nonLinearizedInput.begin(), tanh);
-        } else {
-            std::copy(currentInputs.begin(), currentInputs.end(), nonLinearizedInput.begin());
+        if (currentInputs.size() != inputs.size()) {
+            throw std::logic_error("Input component count doesn't match.");
         }
 
-        currentOutputs = nonLinearizedInput * weights;
+        currentInputs = inputs;
+
+        if (layerIndex != 0) {
+            std::transform(inputs.begin(), inputs.end(), inputs.begin(), tanh);
+        }
+
+        currentOutputs = inputs * weights;
     }
 
     std::vector<float> getOutputs() const
@@ -178,7 +318,10 @@ public:
         Matrix nextLayerSensitivityMatrix(static_cast<int>(nextLayerSensitivity.size()), 1, nextLayerSensitivity);
         sensitivity = (weights * nextLayerSensitivityMatrix).asVector();
 
-        std::transform(sensitivity.begin(), sensitivity.end(), sensitivity.begin(), [](float v) { return 1 - tanh(v) * tanh(v); });
+        std::vector<float> nonLinearizedInput(currentInputs.size());
+        std::transform(currentInputs.begin(), currentInputs.end(), nonLinearizedInput.begin(), [](float v) { return 1 - tanh(v) * tanh(v); });
+
+        std::transform(nonLinearizedInput.begin(), nonLinearizedInput.end(), sensitivity.begin(), sensitivity.begin(), [](float i, float s) { return i * s; });
 
         return sensitivity;
     }
@@ -186,16 +329,20 @@ public:
     void updateWeight(std::vector<float> nextLayerSensitivity)
     {
         std::vector<float> nonLinearizedInput(currentInputs.size());
-        if (layerIndex != 0) {
+//        if (layerIndex != 0) {
             std::transform(currentInputs.begin(), currentInputs.end(), nonLinearizedInput.begin(), tanh);
-        } else {
-            std::copy(currentInputs.begin(), currentInputs.end(), nonLinearizedInput.begin());
-        }
+//        } else {
+//            std::copy(currentInputs.begin(), currentInputs.end(), nonLinearizedInput.begin());
+//        }
 
         const int inputSize = static_cast<int>(currentInputs.size());
         const int outputSize = static_cast<int>(nextLayerSensitivity.size());
 
         weights -= Matrix(inputSize, 1, nonLinearizedInput) * Matrix(1, outputSize, nextLayerSensitivity) * learningRate;
+    }
+
+    void showWeights() const {
+        std::cout << weights.str() << std::endl;
     }
 };
 
@@ -213,13 +360,13 @@ public:
             throw std::invalid_argument("invalid parameters.");
         }
 
-        const size_t layerCount = componentSizeList.size() - 1;
-        for (size_t layerIndex = 0; layerIndex != layerCount; ++layerIndex) {
-            Layer layer(static_cast<int>(layerIndex),
+        const int layerCount = static_cast<int>(componentSizeList.size() - 1);
+        for (int layerIndex = 0; layerIndex != layerCount; ++layerIndex) {
+            Layer layer(layerIndex,
                         componentSizeList[layerIndex],
                         componentSizeList[layerIndex + 1],
                         0.01, // learning rate
-                        randomGenerator);
+                        &randomGenerator);
             layers.push_back(layer);
         }
     }
@@ -263,5 +410,9 @@ public:
             layerInputs = layer.getOutputs();
         }
         return layerInputs;
+    }
+
+    void showWeights(int layerIndex) const {
+        layers[layerIndex].showWeights();
     }
 };
