@@ -34,22 +34,13 @@ int main(int argc, const char * argv[]) {
     }
 
 
-    cout << "Elapsed " << (std::clock() - start) / (double)CLOCKS_PER_SEC << " seconds." << endl;
-
     cout << "Test!" << endl;
-    vector<float> v[4];
-    v[0] = nn.test({0.1, 0.2});
-    v[1] = nn.test({0.3, 0.4});
-    v[2] = nn.test({0.5, 0.6});
-    v[3] = nn.test({0.7, 0.8});
+    cout << nn.test({0.1, 0.2})->value().str() << endl;
+    cout << nn.test({0.3, 0.4})->value().str() << endl;
+    cout << nn.test({0.5, 0.6})->value().str() << endl;
+    cout << nn.test({0.7, 0.8})->value().str() << endl;
 
-    for (auto const& result : v) {
-        for (auto value : result) {
-            cout << std::setprecision(5) << std::fixed << std::setw(12);
-            cout << value;
-        }
-        cout << endl;
-    }
+    cout << "Elapsed " << (std::clock() - start) / (double)CLOCKS_PER_SEC << " seconds." << endl;
 
     return 0;
 }
