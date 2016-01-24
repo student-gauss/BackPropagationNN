@@ -6,6 +6,8 @@
 #include <sstream>
 #include <iostream>
 #include <iomanip>
+#include <mutex>
+#include <dispatch/dispatch.h>
 
 class Matrix
 {
@@ -14,6 +16,14 @@ private:
     std::vector<std::vector<float>> data;
 public:
     friend Matrix multiplyImmediately(Matrix const& lhs, Matrix const& rhs);
+
+    void swap(Matrix& other) {
+        std::swap(data, other.data);
+    }
+
+    Matrix()
+    {
+    }
 
     Matrix(int numberOfRows, int numberOfColumns)
         :data(numberOfRows, std::vector<float>(numberOfColumns))
@@ -29,6 +39,21 @@ public:
                 data[rowIndex][columnIndex] = v[index++];
             }
         }
+    }
+
+    Matrix(Matrix&& other)
+        :data(std::move(other.data))
+    {
+    }
+
+    Matrix(Matrix const& other)
+        :data(other.data)
+    {
+    }
+
+    Matrix& operator=(Matrix m) {
+        swap(m);
+        return *this;
     }
 
     void initializeWithRandom(std::mt19937* randomGenerator) {
@@ -60,27 +85,27 @@ public:
         return stream.str();
     }
 
-    int rowCount() const
+    int getRowCount() const
     {
         return static_cast<int>(data.size());
     }
 
-    int columnCount() const
+    int getColumnCount() const
     {
         return static_cast<int>(data[0].size());
     }
 
     void applyTanh() {
-        for (int rowIndex = 0; rowIndex < rowCount(); ++rowIndex) {
-            for (int columnIndex = 0; columnIndex < columnCount(); ++columnIndex) {
+        for (int rowIndex = 0; rowIndex < getRowCount(); ++rowIndex) {
+            for (int columnIndex = 0; columnIndex < getColumnCount(); ++columnIndex) {
                 data[rowIndex][columnIndex] = tanh(data[rowIndex][columnIndex]);
             }
         }
     }
 
     void applyDerivativeOfTanh() {
-        for (int rowIndex = 0; rowIndex < rowCount(); ++rowIndex) {
-            for (int columnIndex = 0; columnIndex < columnCount(); ++columnIndex) {
+        for (int rowIndex = 0; rowIndex < getRowCount(); ++rowIndex) {
+            for (int columnIndex = 0; columnIndex < getColumnCount(); ++columnIndex) {
                 float v = tanh(data[rowIndex][columnIndex]);
                 data[rowIndex][columnIndex] = 1 - v * v;
             }
@@ -88,8 +113,8 @@ public:
     }
 
     void applyScale(float scale) {
-        for (int rowIndex = 0; rowIndex < rowCount(); ++rowIndex) {
-            for (int columnIndex = 0; columnIndex < columnCount(); ++columnIndex) {
+        for (int rowIndex = 0; rowIndex < getRowCount(); ++rowIndex) {
+            for (int columnIndex = 0; columnIndex < getColumnCount(); ++columnIndex) {
                 data[rowIndex][columnIndex] *= scale;
             }
         }
@@ -97,8 +122,8 @@ public:
 
     void subtractBy(Matrix const& matrix)
     {
-        for (int rowIndex = 0; rowIndex < rowCount(); ++rowIndex) {
-            for (int columnIndex = 0; columnIndex < columnCount(); ++columnIndex) {
+        for (int rowIndex = 0; rowIndex < getRowCount(); ++rowIndex) {
+            for (int columnIndex = 0; columnIndex < getColumnCount(); ++columnIndex) {
                 data[rowIndex][columnIndex] -= matrix[rowIndex][columnIndex];
             }
         }
@@ -106,28 +131,28 @@ public:
 
     void addBy(Matrix const& matrix)
     {
-        for (int rowIndex = 0; rowIndex < rowCount(); ++rowIndex) {
-            for (int columnIndex = 0; columnIndex < columnCount(); ++columnIndex) {
+        for (int rowIndex = 0; rowIndex < getRowCount(); ++rowIndex) {
+            for (int columnIndex = 0; columnIndex < getColumnCount(); ++columnIndex) {
                 data[rowIndex][columnIndex] += matrix[rowIndex][columnIndex];
             }
         }
     }
 };
 
-inline Matrix multiplyImmdiately(Matrix const& lhs, Matrix const& rhs)
+inline Matrix multiplyImmdiately(Matrix lhs, Matrix rhs)
 {
-    if (lhs.columnCount() != rhs.rowCount()) {
+    if (lhs.getColumnCount() != rhs.getRowCount()) {
         throw std::logic_error("incompatible matrices");
     }
 
-    const int resultRowCount = lhs.rowCount();
-    const int resultColumnCount = rhs.columnCount();
+    const int resultRowCount = lhs.getRowCount();
+    const int resultColumnCount = rhs.getColumnCount();
 
-    Matrix result(lhs.rowCount(), rhs.columnCount());
+    Matrix result(resultRowCount, resultColumnCount);
 
     for (int resultRowIndex = 0; resultRowIndex != resultRowCount; ++resultRowIndex) {
         for (int resultColumnIndex = 0; resultColumnIndex != resultColumnCount; ++resultColumnIndex) {
-            const int count = lhs.columnCount();
+            const int count = lhs.getColumnCount();
             float v = 0;
             for (int index = 0; index != count; ++index) {
                 v += lhs[resultRowIndex][index] * rhs[index][resultColumnIndex];
@@ -140,20 +165,38 @@ inline Matrix multiplyImmdiately(Matrix const& lhs, Matrix const& rhs)
 
 class Expression
 {
-    std::shared_future<Matrix> computedValue;
+private:
+    std::mutex computeOnceMutex;
+    bool wasComputed;
+    Matrix computedValue;
+
 protected:
-    Expression() {}
+    Expression() : wasComputed(false) {}
 public:
     virtual ~Expression() {}
-    virtual int rowCount() const = 0;
-    virtual int columnCount() const = 0;
+    virtual int getRowCount() const = 0;
+    virtual int getColumnCount() const = 0;
 
-    virtual Matrix value() = 0;
+    virtual std::string getDescription(int indent = 0) = 0;
 
     std::string str() {
         Matrix v = value();
         return v.str();
     }
+
+    Matrix value() {
+        std::lock_guard<std::mutex> lock(computeOnceMutex);
+        if (!wasComputed) {
+            computedValue = computeValue();
+        }
+        return computedValue;
+    }
+private:
+    static void computeValueOnce(void *context) {
+        Expression *expression = reinterpret_cast<Expression *>(context);
+        expression->computedValue = expression->computeValue();
+    }
+    virtual Matrix computeValue() = 0;
 };
 
 class BinaryOperator : public Expression
@@ -161,24 +204,47 @@ class BinaryOperator : public Expression
 private:
     std::shared_ptr<Expression> leftOperand;
     std::shared_ptr<Expression> rightOperand;
+
+    dispatch_queue_t dispatchQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+
 protected:
     BinaryOperator(std::shared_ptr<Expression> left, std::shared_ptr<Expression> right)
         :leftOperand(left), rightOperand(right)
     {
     }
 
-    virtual int rowCount() const
+    virtual int getRowCount() const
     {
-        return left()->rowCount();
+        return left()->getRowCount();
     }
 
-    virtual int columnCount() const
+    virtual int getColumnCount() const
     {
-        return left()->columnCount();
+        return left()->getColumnCount();
     }
 
     std::shared_ptr<Expression> left() const { return leftOperand; }
     std::shared_ptr<Expression> right() const { return rightOperand; }
+
+    std::pair<Matrix, Matrix> computeOperands() {
+        dispatch_group_t group = dispatch_group_create();
+
+        __block Matrix leftValue;
+        dispatch_group_async( group, dispatchQueue, ^{
+                auto leftExpression = left();
+                leftValue = leftExpression->value();
+            });
+
+        __block Matrix rightValue;
+        dispatch_group_async( group, dispatchQueue, ^{
+                auto rightExpression = right();
+                rightValue = rightExpression->value();
+            });
+        dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+        dispatch_release(group);
+
+        return std::make_pair(std::move(leftValue), std::move(rightValue));
+    }
 };
 
 class UnaryOperator : public Expression
@@ -190,14 +256,14 @@ public:
         :operand(argument) {
     }
 
-    virtual int rowCount() const
+    virtual int getRowCount() const
     {
-        return argument()->rowCount();
+        return argument()->getRowCount();
     }
 
-    virtual int columnCount() const
+    virtual int getColumnCount() const
     {
-        return argument()->columnCount();
+        return argument()->getColumnCount();
     }
 
     std::shared_ptr<Expression> argument() const { return operand; }
@@ -211,21 +277,32 @@ public:
     {
     }
 
-    virtual int rowCount() const
+    virtual int getRowCount() const
     {
-        return left()->rowCount();
+        return left()->getRowCount();
     }
 
-    virtual int columnCount() const
+    virtual int getColumnCount() const
     {
-        return right()->columnCount();
+        return right()->getColumnCount();
     }
 
-    virtual Matrix value() {
-        Matrix leftValue = left()->value();
-        Matrix rightValue = right()->value();
-        return multiplyImmdiately(leftValue, rightValue);
+    virtual Matrix computeValue() {
+        auto operands = computeOperands();
+        return multiplyImmdiately(std::move(operands.first), std::move(operands.second));
     }
+
+    virtual std::string getDescription(int indent)
+    {
+        std::ostringstream sstream;
+        sstream << std::string(indent, ' ');
+        sstream << "Multiply[" << this << "]" << std::endl;
+        sstream << left()->getDescription(indent + 2);
+        sstream << right()->getDescription(indent + 2);
+
+        return sstream.str();
+    }
+
 };
 
 class Plus : public BinaryOperator
@@ -234,17 +311,29 @@ public:
     Plus(std::shared_ptr<Expression> left, std::shared_ptr<Expression> right)
         :BinaryOperator(left, right)
     {
-        if (left->rowCount() != right->rowCount() ||
-            left->columnCount() != right->columnCount()) {
+        if (left->getRowCount() != right->getRowCount() ||
+            left->getColumnCount() != right->getColumnCount()) {
             throw std::invalid_argument("incompatible matrix.");
         }
     }
 
-    virtual Matrix value() {
-        Matrix leftValue = left()->value();
-        Matrix rightValue = right()->value();
+    virtual Matrix computeValue() {
+        auto operands = computeOperands();
+        Matrix leftValue = std::move(operands.first);
+        Matrix rightValue = std::move(operands.second);
         leftValue.addBy(rightValue);
         return leftValue;
+    }
+
+    virtual std::string getDescription(int indent)
+    {
+        std::ostringstream sstream;
+        sstream << std::string(indent, ' ');
+        sstream << "Plus[" << this << "]" << std::endl;
+        sstream << left()->getDescription(indent + 2);
+        sstream << right()->getDescription(indent + 2);
+
+        return sstream.str();
     }
 };
 
@@ -254,17 +343,29 @@ public:
     Minus(std::shared_ptr<Expression> left, std::shared_ptr<Expression> right)
         :BinaryOperator(left, right)
     {
-        if (left->rowCount() != right->rowCount() ||
-            left->columnCount() != right->columnCount()) {
+        if (left->getRowCount() != right->getRowCount() ||
+            left->getColumnCount() != right->getColumnCount()) {
             throw std::invalid_argument("incompatible matrix.");
         }
     }
 
-    virtual Matrix value() {
-        Matrix leftValue = left()->value();
-        Matrix rightValue = right()->value();
+    virtual Matrix computeValue() {
+        auto operands = computeOperands();
+        Matrix leftValue = std::move(operands.first);
+        Matrix rightValue = std::move(operands.second);
         leftValue.subtractBy(rightValue);
         return leftValue;
+    }
+
+    virtual std::string getDescription(int indent)
+    {
+        std::ostringstream sstream;
+        sstream << std::string(indent, ' ');
+        sstream << "Minus[" << this << "]" << std::endl;
+        sstream << left()->getDescription(indent + 2);
+        sstream << right()->getDescription(indent + 2);
+
+        return sstream.str();
     }
 };
 
@@ -274,28 +375,39 @@ public:
     ElementByElementMultiply(std::shared_ptr<Expression> left, std::shared_ptr<Expression> right)
         :BinaryOperator(left, right)
     {
-        if (left->rowCount() * left->columnCount() != right->rowCount() * right->columnCount()) {
+        if (left->getRowCount() * left->getColumnCount() != right->getRowCount() * right->getColumnCount()) {
             throw std::invalid_argument("incompatible matrix.");
         }
     }
 
-    virtual Matrix value() {
+    virtual Matrix computeValue() {
         Matrix leftValue = left()->value();
         Matrix rightValue = right()->value();
 
-        int rowCount = leftValue.rowCount();
-        int columnCount = leftValue.columnCount();
+        int rowCount = leftValue.getRowCount();
+        int columnCount = leftValue.getColumnCount();
         int index = 0;
         for (int rowIndex = 0; rowIndex != rowCount; rowIndex++) {
             for (int columnIndex = 0; columnIndex != columnCount; columnIndex++) {
-                int rightRowIndex = index / rightValue.columnCount();
-                int rightColumnIndex = index % rightValue.columnCount();
+                int rightRowIndex = index / rightValue.getColumnCount();
+                int rightColumnIndex = index % rightValue.getColumnCount();
                 leftValue[rowIndex][columnIndex] *= rightValue[rightRowIndex][rightColumnIndex];
                 index++;
             }
         }
 
         return leftValue;
+    }
+
+    virtual std::string getDescription(int indent)
+    {
+        std::ostringstream sstream;
+        sstream << std::string(indent, ' ');
+        sstream << "Element-By-Element Multiply[" << this << "]" << std::endl;
+        sstream << left()->getDescription(indent + 2);
+        sstream << right()->getDescription(indent + 2);
+
+        return sstream.str();
     }
 };
 
@@ -305,34 +417,45 @@ public:
     OutputSensitivity(std::shared_ptr<Expression> prediction, std::shared_ptr<Expression> truth)
         :BinaryOperator(prediction, truth)
     {
-        if (prediction->rowCount() != 1 ||
-            truth->rowCount() != 1 ||
-            prediction->columnCount() != truth->columnCount()) {
+        if (prediction->getRowCount() != 1 ||
+            truth->getRowCount() != 1 ||
+            prediction->getColumnCount() != truth->getColumnCount()) {
             throw std::invalid_argument("incompatible matrix.");
         }
     }
 
-    virtual int rowCount() const
+    virtual int getRowCount() const
     {
-        return left()->columnCount();
+        return left()->getColumnCount();
     }
 
-    virtual int columnCount() const
+    virtual int getColumnCount() const
     {
         return 1;
     }
 
-    virtual Matrix value() {
+    virtual Matrix computeValue() {
         Matrix prediction = left()->value();
         Matrix truth = right()->value();
-        Matrix sensitivity(prediction.columnCount(), 1);
+        Matrix sensitivity(prediction.getColumnCount(), 1);
 
-        int columnCount = prediction.columnCount();
+        int columnCount = prediction.getColumnCount();
         for (int columnIndex = 0; columnIndex != columnCount; columnIndex++) {
             sensitivity[columnIndex][0] = 2 * (prediction[0][columnIndex] - truth[0][columnIndex]);
         }
 
         return sensitivity;
+    }
+
+    virtual std::string getDescription(int indent)
+    {
+        std::ostringstream sstream;
+        sstream << std::string(indent, ' ');
+        sstream << "OutputSensitibity[" << this << "]" << std::endl;
+        sstream << left()->getDescription(indent + 2);
+        sstream << right()->getDescription(indent + 2);
+
+        return sstream.str();
     }
 };
 
@@ -343,10 +466,20 @@ public:
         :UnaryOperator(operand) {
     }
 
-    virtual Matrix value() {
+    virtual Matrix computeValue() {
         Matrix argumentValue = argument()->value();
         argumentValue.applyTanh();
         return argumentValue;
+    }
+
+    virtual std::string getDescription(int indent)
+    {
+        std::ostringstream sstream;
+        sstream << std::string(indent, ' ');
+        sstream << "Tanh[" << this << "]" << std::endl;
+        sstream << argument()->getDescription(indent + 2);
+
+        return sstream.str();
     }
 };
 
@@ -360,10 +493,20 @@ public:
          scale(scale){
     }
 
-    virtual Matrix value() {
+    virtual Matrix computeValue() {
         Matrix argumentValue = argument()->value();
         argumentValue.applyScale(scale);
         return argumentValue;
+    }
+
+    virtual std::string getDescription(int indent)
+    {
+        std::ostringstream sstream;
+        sstream << std::string(indent, ' ');
+        sstream << "Scale[" << this << "]" << std::endl;
+        sstream << argument()->getDescription(indent + 2);
+
+        return sstream.str();
     }
 };
 
@@ -374,10 +517,20 @@ public:
         :UnaryOperator(operand) {
     }
 
-    virtual Matrix value() {
+    virtual Matrix computeValue() {
         Matrix argumentValue = argument()->value();
         argumentValue.applyDerivativeOfTanh();
         return argumentValue;
+    }
+
+    virtual std::string getDescription(int indent)
+    {
+        std::ostringstream sstream;
+        sstream << std::string(indent, ' ');
+        sstream << "DTanh[" << this << "]" << std::endl;
+        sstream << argument()->getDescription(indent + 2);
+
+        return sstream.str();
     }
 };
 
@@ -388,55 +541,79 @@ public:
         :UnaryOperator(argument) {
     }
 
-    virtual int rowCount() const
+    virtual int getRowCount() const
     {
-        return argument()->columnCount();
+        return argument()->getColumnCount();
     }
 
-    virtual int columnCount() const
+    virtual int getColumnCount() const
     {
-        return argument()->rowCount();
+        return argument()->getRowCount();
     }
 
-    virtual Matrix value() {
+    virtual Matrix computeValue() {
         Matrix source = argument()->value();
-        Matrix transposed(source.columnCount(), source.rowCount());
+        Matrix transposed(source.getColumnCount(), source.getRowCount());
 
-        for (int rowIndex = 0; rowIndex != source.rowCount(); rowIndex++) {
-            for (int columnIndex = 0; columnIndex != source.columnCount(); columnIndex++) {
+        for (int rowIndex = 0; rowIndex != source.getRowCount(); rowIndex++) {
+            for (int columnIndex = 0; columnIndex != source.getColumnCount(); columnIndex++) {
                 transposed[columnIndex][rowIndex] = source[rowIndex][columnIndex];
             }
         }
         return transposed;
     }
+
+    virtual std::string getDescription(int indent)
+    {
+        std::ostringstream sstream;
+        sstream << std::string(indent, ' ');
+        sstream << "Transpose[" << this << "]" << std::endl;
+        sstream << argument()->getDescription(indent + 2);
+
+        return sstream.str();
+    }
 };
 
 class Term : public Expression
 {
+    int rowCount;
+    int columnCount;
     Matrix matrix;
 public:
     Term(Matrix initMatrix)
-        :matrix(initMatrix)
+        :matrix(initMatrix),
+         rowCount(initMatrix.getRowCount()),
+         columnCount(initMatrix.getColumnCount())
     {
     }
 
     Term(std::vector<float> const& v)
-        :matrix(1, static_cast<int>(v.size()), v)
+        :matrix(1, static_cast<int>(v.size()), v),
+         rowCount(1),
+         columnCount(static_cast<int>(v.size()))
     {
     }
 
-    virtual int rowCount() const
+    virtual int getRowCount() const
     {
-        return matrix.rowCount();
+        return rowCount;
     }
 
-    virtual int columnCount() const
+    virtual int getColumnCount() const
     {
-        return matrix.columnCount();
+        return columnCount;
     }
 
-    virtual Matrix value() {
+    virtual Matrix computeValue() {
         return matrix;
+    }
+
+    virtual std::string getDescription(int indent)
+    {
+        std::ostringstream sstream;
+        sstream << std::string(indent, ' ');
+        sstream << "Matrix" << std::endl;
+        return sstream.str();
     }
 };
 
@@ -492,6 +669,8 @@ std::shared_ptr<Expression> errorDerivative(std::shared_ptr<Expression> argument
 
 std::shared_ptr<Expression> compute(std::shared_ptr<Expression> v)
 {
+    using namespace std;
+//    cout << v->getDescription() << std::endl;
     return std::make_shared<Term>(v->value());
 }
 
@@ -527,18 +706,18 @@ public:
 
     void setInputs(std::shared_ptr<Expression> inputs)
     {
-        if (inputs->rowCount() != 1 ||
-            inputs->columnCount() != numberOfInputs ) {
+        if (inputs->getRowCount() != 1 ||
+            inputs->getColumnCount() != numberOfInputs ) {
             throw std::logic_error("Input component count doesn't match.");
         }
 
-        currentInputs = compute(inputs);
+        currentInputs = inputs;
 
         if (layerIndex != 0) {
             inputs = std::make_shared<Tanh>(inputs);
         }
 
-        currentOutputs = compute(inputs * weights);
+        currentOutputs = inputs * weights;
     }
 
     std::shared_ptr<Expression> getOutputs() const
@@ -548,12 +727,12 @@ public:
 
     std::shared_ptr<Expression> computeSensitivity(std::shared_ptr<Expression> nextLayerSensitivity)
     {
-        if (nextLayerSensitivity->rowCount()    != numberOfOutputs ||
-            nextLayerSensitivity->columnCount() != 1 ) {
+        if (nextLayerSensitivity->getRowCount()    != numberOfOutputs ||
+            nextLayerSensitivity->getColumnCount() != 1 ) {
             throw std::invalid_argument("invalid matrix.");
         }
 
-        sensitivity = compute(elementByElementMultiply(weights * nextLayerSensitivity, derivativeOfTanh(currentInputs)));
+        sensitivity = elementByElementMultiply(weights * nextLayerSensitivity, derivativeOfTanh(currentInputs));
 
         return sensitivity;
     }
