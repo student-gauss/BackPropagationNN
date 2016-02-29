@@ -192,10 +192,6 @@ public:
         return computedValue;
     }
 private:
-    static void computeValueOnce(void *context) {
-        Expression *expression = reinterpret_cast<Expression *>(context);
-        expression->computedValue = expression->computeValue();
-    }
     virtual Matrix computeValue() = 0;
 };
 
